@@ -30,14 +30,14 @@ class CAbstractor(nn.Module):
     def __init__(
         self,
         enc_dim: int = 192,
-        llm_dim: int = 1024,
+        llm_dim: int = 640,
         kernel_size: int = 3,
         stride: int = 2,
     ):
         """
         Args:
             enc_dim: Encoder embedding dimension (192 for ViT-Tiny)
-            llm_dim: LLM embedding dimension (1024 for Gemma3-270M)
+            llm_dim: LLM embedding dimension (640 for Gemma3-270M)
             kernel_size: Convolution kernel size
             stride: Downsampling stride (2 = 4x token reduction)
         """
@@ -71,18 +71,18 @@ class CAbstractor(nn.Module):
             x: Encoder output (B, 196, 192)
             
         Returns:
-            LLM input tokens (B, 49, 1024)
+            LLM input tokens (B, 49, 640)
         """
         B, N, D = x.shape
         H = W = self.grid_size
-        
+
         # Reshape to spatial grid: (B, 196, 192) -> (B, 192, 14, 14)
         x = x.transpose(1, 2).reshape(B, D, H, W)
-        
-        # Apply strided convolution: (B, 192, 14, 14) -> (B, 1024, 7, 7)
+
+        # Apply strided convolution: (B, 192, 14, 14) -> (B, 640, 7, 7)
         x = self.conv(x)
-        
-        # Flatten back to sequence: (B, 1024, 7, 7) -> (B, 49, 1024)
+
+        # Flatten back to sequence: (B, 640, 7, 7) -> (B, 49, 640)
         x = x.flatten(2).transpose(1, 2)
         
         # Normalize
@@ -99,18 +99,18 @@ class CAbstractor(nn.Module):
 if __name__ == "__main__":
     # Quick test
     print("Testing CAbstractor...")
-    
-    connector = CAbstractor(enc_dim=192, llm_dim=1024)
+
+    connector = CAbstractor(enc_dim=192, llm_dim=640)
     print(f"  Encoder dim: {connector.enc_dim}")
     print(f"  LLM dim: {connector.llm_dim}")
     print(f"  Output tokens: {connector.num_out_tokens}")
     print(f"  Output shape: {connector.output_shape}")
-    
+
     # Test forward pass (simulating encoder output)
     dummy_encoder_out = torch.randn(2, 196, 192)
     out = connector(dummy_encoder_out)
     print(f"  Forward test: {dummy_encoder_out.shape} -> {out.shape}")
-    
+
     # Verify output
-    assert out.shape == (2, 49, 1024), f"Expected (2, 49, 1024), got {out.shape}"
+    assert out.shape == (2, 49, 640), f"Expected (2, 49, 640), got {out.shape}"
     print("All tests passed!")
