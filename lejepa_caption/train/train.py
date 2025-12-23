@@ -2,7 +2,9 @@
 Training utilities for LeJEPA Edge Captioner.
 
 Notebook-friendly: assumes the notebook already created the model, tokenizer,
-and LLM; only handles the training loop (cosine + SIGReg).
+and LLM; only handles the training loop with pure MSE loss.
+
+Following LeJEPA philosophy: Simple, principled, no heuristics.
 """
 
 import logging
@@ -20,7 +22,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from lejepa_caption.models import LeJEPACaptioner, SIGRegLoss, get_captioner
+from lejepa_caption.models import LeJEPACaptioner, get_captioner
 
 
 def get_best_device() -> torch.device:
@@ -35,11 +37,14 @@ def get_best_device() -> torch.device:
 class EmbeddingTrainer:
     """
     Trainer for VL-JEPA style embedding prediction.
-    
+
     Key concept: We train the model to predict continuous text embeddings
     that match what Gemma3 would produce for the caption.
+
+    Uses pure MSE loss - supervised regression to target embeddings.
+    No heuristics (no SIGReg, no gradient clipping) following LeJEPA philosophy.
     """
-    
+
     def __init__(
         self,
         model: LeJEPACaptioner,
@@ -48,10 +53,6 @@ class EmbeddingTrainer:
         device: str = "cuda",
         lr: float = 1e-4,
         weight_decay: float = 0.01,
-        lambda_sigreg: float = 0.05,
-        align_weight: float = 1.0,
-        sigreg_n_points: int = 17,
-        sigreg_num_slices: int = 128,
         use_amp: bool = False,
     ):
         if tokenizer is None or llm is None:
@@ -59,28 +60,19 @@ class EmbeddingTrainer:
 
         self.model = model.to(device)
         self.device = device
-        self.lambda_sigreg = lambda_sigreg
-        self.align_weight = align_weight
         self.use_amp = use_amp
         self.scaler = GradScaler(enabled=use_amp and torch.cuda.is_available())
 
         # Preloaded tokenizer/LLM
         self.tokenizer = tokenizer
         self.llm = llm
-        
+
         # Optimizer
         self.optimizer = AdamW(
             model.parameters(),
             lr=lr,
             weight_decay=weight_decay,
         )
-
-        # Loss functions
-        self.sigreg = SIGRegLoss(
-            n_points=sigreg_n_points,
-            num_slices=sigreg_num_slices,
-            reduction="mean",
-        ).to(device)
     
     def get_target_embeddings(
         self, 
@@ -113,66 +105,56 @@ class EmbeddingTrainer:
         return embeddings.float()
     
     def train_step(
-        self, 
-        images: torch.Tensor, 
+        self,
+        images: torch.Tensor,
         captions: list
     ) -> dict:
         """
         Single training step.
-        
+
         Args:
             images: Batch of images (B, 3, 224, 224)
             captions: List of caption strings
-            
+
         Returns:
-            Dict with loss values
+            Dict with loss value
         """
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        
+
         images = images.to(self.device)
-        
+
         # Forward pass - predict embeddings
         with autocast(enabled=self.use_amp):
-            pred_embeds = self.model(images)  # (B, max_len, 1024)
+            pred_embeds = self.model(images)  # (B, 50, 640)
 
-            # Get target embeddings from LLM
+            # Get target embeddings from frozen Gemma-3
             target_embeds = self.get_target_embeddings(
-                captions, 
+                captions,
                 max_len=pred_embeds.size(1)
             )
             target_embeds = target_embeds.to(pred_embeds.dtype)
 
-            # Cosine alignment + SIGReg regularization
-            align_loss = 1.0 - F.cosine_similarity(pred_embeds, target_embeds, dim=-1, eps=1e-8).mean()
-            sigreg_loss = self.sigreg(pred_embeds)
-            loss = self.align_weight * align_loss + self.lambda_sigreg * sigreg_loss
-        
-        # Backward
+            # Pure MSE loss - supervised regression
+            loss = F.mse_loss(pred_embeds, target_embeds)
+
+        # Backward (no gradient clipping - MSE is stable)
         if self.scaler is not None and self.use_amp:
             self.scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-        
-        return {
-            "loss": loss.item(),
-            "align_loss": align_loss.item(),
-            "sigreg_loss": sigreg_loss.item(),
-        }
+
+        return {"loss": loss.item()}
     
     def validate(self, dataloader) -> dict:
         """Run validation."""
         self.model.eval()
         total_loss = 0
-        total_align = 0
-        total_sigreg = 0
         num_batches = 0
-        
+
         with torch.inference_mode():
             for images, captions in tqdm(dataloader, desc="Validating"):
                 images = images.to(self.device)
@@ -184,21 +166,13 @@ class EmbeddingTrainer:
                 )
 
                 target_embeds = target_embeds.to(pred_embeds.dtype)
-                align_loss = 1.0 - F.cosine_similarity(pred_embeds, target_embeds, dim=-1, eps=1e-8).mean()
-                sigreg_loss = self.sigreg(pred_embeds)
-                loss = self.align_weight * align_loss + self.lambda_sigreg * sigreg_loss
+                loss = F.mse_loss(pred_embeds, target_embeds)
 
                 total_loss += loss.item()
-                total_align += align_loss.item()
-                total_sigreg += sigreg_loss.item()
                 num_batches += 1
 
         denom = max(1, num_batches)
-        return {
-            "val_loss": total_loss / denom,
-            "val_align": total_align / denom,
-            "val_sigreg": total_sigreg / denom,
-        }
+        return {"val_loss": total_loss / denom}
     
     def save_checkpoint(self, path: str, epoch: int):
         """Save model checkpoint."""
@@ -216,15 +190,28 @@ def train_with_loader(
     device: str = "cuda",
     lr: float = 1e-4,
     weight_decay: float = 0.01,
-    lambda_sigreg: float = 0.05,
-    align_weight: float = 1.0,
-    sigreg_n_points: int = 17,
-    sigreg_num_slices: int = 128,
     use_amp: bool = False,
     epochs: int = 3,
 ):
     """
-    Notebook-friendly training helper. Requires prebuilt model, tokenizer, llm, and dataloader.
+    Notebook-friendly training helper.
+
+    Uses pure MSE loss for supervised embedding prediction.
+    No heuristics (no SIGReg, no gradient clipping).
+
+    Args:
+        model: LeJEPACaptioner instance
+        train_loader: DataLoader with (images, captions)
+        tokenizer: Pretrained tokenizer (from notebook)
+        llm: Pretrained LLM (from notebook, frozen)
+        device: 'cuda' or 'cpu'
+        lr: Learning rate
+        weight_decay: AdamW weight decay
+        use_amp: Use automatic mixed precision
+        epochs: Number of training epochs
+
+    Returns:
+        EmbeddingTrainer instance (with trained model)
     """
     device = torch.device(device)
     trainer = EmbeddingTrainer(
@@ -234,21 +221,13 @@ def train_with_loader(
         device=device,
         lr=lr,
         weight_decay=weight_decay,
-        lambda_sigreg=lambda_sigreg,
-        align_weight=align_weight,
-        sigreg_n_points=sigreg_n_points,
-        sigreg_num_slices=sigreg_num_slices,
         use_amp=use_amp,
     )
 
     for epoch in range(1, epochs + 1):
-        pbar = tqdm(train_loader, desc=f"Train {epoch}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
         for images, captions in pbar:
             stats = trainer.train_step(images, captions)
-            pbar.set_postfix({
-                "loss": f"{stats['loss']:.4f}",
-                "align": f"{stats['align_loss']:.4f}",
-                "sigreg": f"{stats['sigreg_loss']:.4f}",
-            })
+            pbar.set_postfix({"loss": f"{stats['loss']:.4f}"})
 
     return trainer
