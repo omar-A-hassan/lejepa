@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "lejepa"
 version = "0.0.1"
-dependencies = ["torch", "numpy", "loguru", "pytest"]
+dependencies = ["torch", "torchvision", "timm", "numpy", "scipy", "datasets", "transformers", "tqdm", "loguru", "pytest"]
 requires-python = ">=3.8"
 authors = [
   {name = "Randall Balestriero", email = "randallbalestriero@gmail.com"},
@@ -27,3 +27,6 @@ Documentation = "https://readthedocs.org"
 Repository = "https://github.com/me/spam.git"
 "Bug Tracker" = "https://github.com/me/spam/issues"
 Changelog = "https://github.com/me/spam/blob/master/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lejepa", "lejepa_caption"]
