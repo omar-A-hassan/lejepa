@@ -8,10 +8,12 @@ Verifies that:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 sys.path.insert(0, '.')
 
 from lejepa_caption.models.encoder import VisionEncoder
+from lejepa_caption.models.sigreg import SIGRegLoss
 
 # Import LeJEPA's SIGReg
 try:
@@ -112,6 +114,34 @@ def test_with_sigreg():
     print("Backward pass successful")
 
 
+def test_sigreg_loss_on_text_embeddings():
+    """Ensure SIGRegLoss works on sequence embeddings and is finite."""
+    sigreg = SIGRegLoss(n_points=11, num_slices=64)
+    preds = torch.randn(2, 10, 640, requires_grad=True)
+    loss = sigreg(preds)
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+    loss.backward()
+    assert preds.grad is not None
+
+
+def test_composite_cosine_sigreg_loss():
+    """Cosine alignment plus SIGReg stays finite and backprops."""
+    sigreg = SIGRegLoss(n_points=11, num_slices=64)
+    preds = torch.randn(2, 8, 640, requires_grad=True)
+    targets = torch.randn(2, 8, 640)
+
+    align_loss = 1.0 - F.cosine_similarity(preds, targets, dim=-1, eps=1e-8).mean()
+    sigreg_loss = sigreg(preds)
+    loss = align_loss + 0.05 * sigreg_loss
+
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert preds.grad is not None
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("LeJEPA Compatibility Test")
@@ -120,6 +150,8 @@ if __name__ == "__main__":
     test_basic_encoder()
     test_with_projector()
     test_with_sigreg()
+    test_sigreg_loss_on_text_embeddings()
+    test_composite_cosine_sigreg_loss()
     
     print("\n" + "=" * 50)
     print("All compatibility tests passed!")
