@@ -37,14 +37,22 @@ class COCOCaptionsDataset(Dataset):
             from datasets import load_dataset
         except ImportError:
             raise ImportError("Install datasets: pip install datasets")
-        
-        # Load COCO from HuggingFace
+
+        # Load COCO from a script-free source to avoid trust_remote_code bans (e.g., Kaggle)
+        # Dataset fields: image (PIL), sentences_raw (list[str])
         print(f"Loading COCO Captions ({split})...")
-        self.dataset = load_dataset(
-            "HuggingFaceM4/COCO",
-            split=split,
-            trust_remote_code=True,
-        )
+        requested_split = "train" if split == "train" else "validation"
+        try:
+            self.dataset = load_dataset(
+                "Multimodal-Fatima/COCO_captions_train",
+                split=requested_split,
+            )
+        except Exception:
+            # Fallback: if only train split exists, reuse it for validation
+            self.dataset = load_dataset(
+                "Multimodal-Fatima/COCO_captions_train",
+                split="train",
+            )
         
         if max_samples:
             self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
@@ -82,14 +90,10 @@ class COCOCaptionsDataset(Dataset):
         
         image = self.transform(image)
         
-        # Handle caption (COCO has multiple captions per image)
-        captions = item.get("sentences", item.get("captions", []))
+        # Handle caption (dataset stores a list of raw sentences)
+        captions = item.get("sentences_raw", item.get("captions", []))
         if isinstance(captions, list) and len(captions) > 0:
-            # Get first caption or randomly sample
-            if isinstance(captions[0], dict):
-                caption = captions[0].get("raw", captions[0].get("text", ""))
-            else:
-                caption = captions[0]
+            caption = captions[0]
         else:
             caption = str(captions)
         
@@ -97,11 +101,10 @@ class COCOCaptionsDataset(Dataset):
 
 
 def get_train_augmentations() -> transforms.Compose:
-    """Training augmentations with random crop and color jitter."""
+    """Deterministic train transform matching the notebook path."""
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
