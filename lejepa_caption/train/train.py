@@ -181,19 +181,20 @@ class EmbeddingTrainer:
         """
         B, L, D = pred_embeds.shape
 
-        # Flatten sequence dimension: (B, L, D) -> (B*L, D)
-        pred_flat = pred_embeds.reshape(-1, D)
-        target_flat = target_embeds.reshape(-1, D)
+        # Pool sequence dimension: (B, L, D) -> (B, D)
+        # One embedding per caption, not per token position
+        pred_pooled = pred_embeds.mean(dim=1)
+        target_pooled = target_embeds.mean(dim=1)
 
         # L2 normalize for cosine similarity
-        pred_norm = F.normalize(pred_flat, dim=-1, p=2)
-        target_norm = F.normalize(target_flat, dim=-1, p=2)
+        pred_norm = F.normalize(pred_pooled, dim=-1, p=2)
+        target_norm = F.normalize(target_pooled, dim=-1, p=2)
 
-        # Cosine similarity matrix: (B*L) x (B*L)
+        # Cosine similarity matrix: (B) x (B)
         logits = (pred_norm @ target_norm.T) / self.temperature
 
         # Labels: diagonal (pred[i] should match target[i])
-        labels = torch.arange(B * L, device=self.device)
+        labels = torch.arange(B, device=self.device)
 
         # Bi-directional InfoNCE (pred->target and target->pred)
         loss_pred_to_target = F.cross_entropy(logits, labels)
