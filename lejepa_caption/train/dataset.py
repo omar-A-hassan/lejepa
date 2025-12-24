@@ -13,6 +13,50 @@ from typing import Optional, Callable, List, Tuple
 import os
 
 
+# Module-level cache for train/val splits (load once, reuse)
+_CACHED_SPLITS = None
+
+
+def _get_cached_splits(val_ratio: float = 0.05, seed: int = 42):
+    """
+    Load and cache train/val splits from HuggingFace dataset.
+    
+    Since Multimodal-Fatima/COCO_captions_train only has a 'train' split,
+    we manually split it into train (95%) and validation (5%).
+    
+    Args:
+        val_ratio: Fraction for validation (default 5% ≈ 5,664 samples)
+        seed: Random seed for reproducible splits
+    
+    Returns:
+        Dict with 'train' and 'validation' splits
+    """
+    global _CACHED_SPLITS
+    
+    if _CACHED_SPLITS is not None:
+        return _CACHED_SPLITS
+    
+    from datasets import load_dataset
+    
+    print("Loading and splitting COCO dataset (one-time operation)...")
+    full_dataset = load_dataset(
+        "Multimodal-Fatima/COCO_captions_train",
+        split="train",
+    )
+    
+    # Split into train/val (95/5 by default)
+    splits = full_dataset.train_test_split(test_size=val_ratio, seed=seed)
+    _CACHED_SPLITS = {
+        "train": splits["train"],
+        "validation": splits["test"],  # train_test_split calls it "test"
+    }
+    
+    print(f"  Train: {len(_CACHED_SPLITS['train'])} samples")
+    print(f"  Validation: {len(_CACHED_SPLITS['validation'])} samples")
+    
+    return _CACHED_SPLITS
+
+
 class COCOCaptionsDataset(Dataset):
     """
     COCO Captions dataset for VL-JEPA training.
@@ -29,7 +73,7 @@ class COCOCaptionsDataset(Dataset):
     ):
         """
         Args:
-            split: 'train' or 'validation'
+            split: 'train' or 'validation' (or 'val')
             transform: Image transforms (default: standard 224x224)
             max_samples: Limit dataset size for debugging
         """
@@ -38,21 +82,13 @@ class COCOCaptionsDataset(Dataset):
         except ImportError:
             raise ImportError("Install datasets: pip install datasets")
 
-        # Load COCO from a script-free source to avoid trust_remote_code bans (e.g., Kaggle)
-        # Dataset fields: image (PIL), sentences_raw (list[str])
-        print(f"Loading COCO Captions ({split})...")
-        requested_split = "train" if split == "train" else "validation"
-        try:
-            self.dataset = load_dataset(
-                "Multimodal-Fatima/COCO_captions_train",
-                split=requested_split,
-            )
-        except Exception:
-            # Fallback: if only train split exists, reuse it for validation
-            self.dataset = load_dataset(
-                "Multimodal-Fatima/COCO_captions_train",
-                split="train",
-            )
+        # Normalize split name
+        split_key = "train" if split == "train" else "validation"
+        print(f"Loading COCO Captions ({split_key})...")
+        
+        # Get cached splits (loads dataset only once)
+        splits = _get_cached_splits()
+        self.dataset = splits[split_key]
         
         if max_samples:
             self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
