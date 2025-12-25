@@ -236,7 +236,7 @@ class FastNNDecoder:
 
         # Nearest neighbor search
         _, token_ids = self.index.search(pred_flat, k=1)
-        token_ids = token_ids.reshape(B, L).squeeze(-1)
+        token_ids = token_ids.squeeze(-1).reshape(B, L)  # Squeeze k=1 dimension first
 
         # Decode token sequences
         captions = []
