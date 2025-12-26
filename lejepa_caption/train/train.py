@@ -101,12 +101,11 @@ class EmbeddingTrainer:
                     "GradCache requested but not installed. Install with:\n"
                     "  pip install git+https://github.com/luyug/GradCache.git"
                 )
-            self.grad_cache = FunctionalGradCache(
-                model=model,
-                temperature=temperature,
-                mse_alpha=mse_alpha,
-            )
+            # Note: We initialize grad_cache later in _create_gradcache() 
+            # after moco_queue is created so the loss_fn can use it
+            self._pending_gradcache = True
         else:
+            self._pending_gradcache = False
             self.grad_cache = None
 
         # MoCo-style memory queue for negatives
@@ -116,6 +115,10 @@ class EmbeddingTrainer:
             self.moco_queue = MoCoQueue(dim=llm_dim, queue_size=queue_size, device=device)
         else:
             self.moco_queue = None
+        
+        # Now create GradCache with loss function that uses moco_queue
+        if self._pending_gradcache:
+            self._create_gradcache()
 
         # Preloaded tokenizer/LLM
         self.tokenizer = tokenizer
@@ -195,6 +198,29 @@ class EmbeddingTrainer:
             embeddings = self.llm.get_input_embeddings()(tokens.input_ids)
 
         return embeddings.float()
+    
+    def _create_gradcache(self):
+        """
+        Create FunctionalGradCache with a loss function that uses the MoCo queue.
+        
+        This ensures GradCache computes the same loss as the standard training path,
+        including MoCo queue negatives for consistent train/val behavior.
+        """
+        # Create a closure that uses self.infonce_loss (which uses moco_queue)
+        def gradcache_loss_fn(pred_embeds: torch.Tensor, target_embeds: torch.Tensor) -> dict:
+            """
+            Loss function for GradCache that uses MoCo queue.
+            
+            This wraps infonce_loss but handles the queue update carefully:
+            - We compute loss using ALL accumulated embeddings
+            - We only update the queue once after the loss is computed
+            """
+            return self.infonce_loss(pred_embeds, target_embeds)
+        
+        self.grad_cache = FunctionalGradCache(
+            model=self.model,
+            loss_fn=gradcache_loss_fn,
+        )
 
     def infonce_loss(
         self,
@@ -316,14 +342,10 @@ class EmbeddingTrainer:
             target_embeds = self.get_target_embeddings(captions, max_len=max_len)
         
         # Accumulate in GradCache
+        # NOTE: Do NOT update MoCo queue here! The queue is updated inside 
+        # infonce_loss() which is called during compute_loss(). Updating here 
+        # would pollute the queue before we compute loss with all negatives.
         self.grad_cache.accumulate(images, target_embeds)
-        
-        # Update MoCo queue with targets (if enabled)
-        if self.moco_queue is not None:
-            with torch.no_grad():
-                target_pooled = target_embeds.mean(dim=1)
-                target_norm = F.normalize(target_pooled, dim=-1, p=2)
-                self.moco_queue.enqueue(target_norm)
     
     def gradcache_step(self, global_step: int = 0) -> dict:
         """
@@ -335,7 +357,7 @@ class EmbeddingTrainer:
             global_step: Current training step (for logging)
             
         Returns:
-            Dict with loss and metrics
+            Dict with loss and metrics (same format as train_step)
         """
         if self.grad_cache is None:
             raise RuntimeError("GradCache not enabled. Set use_gradcache=True in constructor.")
@@ -346,7 +368,13 @@ class EmbeddingTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         
         # Compute loss with ALL accumulated embeddings
+        # This uses self.infonce_loss which uses the MoCo queue
         loss = self.grad_cache.compute_loss()
+        
+        # Get metrics from the loss computation (before reset!)
+        metrics = self.grad_cache.last_metrics or {}
+        effective_batch = sum(p.shape[0] for p in self.grad_cache._pred_cache)
+        
         loss.backward()
         
         # Propagate gradients through cached representations
@@ -359,20 +387,31 @@ class EmbeddingTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
         
-        # Get metrics
-        loss_value = loss.item()
-        lr_predictor = self.optimizer.param_groups[0]['lr']
-        lr_y_encoder = self.optimizer.param_groups[1]['lr']
-        effective_batch = sum(p.shape[0] for p in self.grad_cache._pred_cache)
-        
         # Reset cache for next accumulation cycle
         self.grad_cache.reset()
         
-        # Wandb logging
+        # Get learning rates
+        loss_value = loss.item()
+        lr_predictor = self.optimizer.param_groups[0]['lr']
+        lr_y_encoder = self.optimizer.param_groups[1]['lr']
+        
+        # Extract metrics (same as train_step for consistency)
+        infonce = metrics.get('infonce', loss_value)
+        mse = metrics.get('mse', 0.0)
+        alignment = metrics.get('alignment', 0.0)
+        uniformity = metrics.get('uniformity', 0.0)
+        num_negatives = metrics.get('num_negatives', effective_batch - 1)
+        
+        # Wandb logging (same metrics as train_step)
         if self.use_wandb:
             import wandb
             wandb.log({
                 "train/loss": loss_value,
+                "train/infonce": infonce,
+                "train/mse": mse,
+                "train/alignment": alignment,
+                "train/uniformity": uniformity,
+                "train/num_negatives": num_negatives,
                 "train/lr_predictor": lr_predictor,
                 "train/lr_y_encoder": lr_y_encoder,
                 "train/effective_batch_size": effective_batch,
@@ -381,6 +420,11 @@ class EmbeddingTrainer:
         
         return {
             'loss': loss_value,
+            'infonce': infonce,
+            'mse': mse,
+            'alignment': alignment,
+            'uniformity': uniformity,
+            'num_negatives': num_negatives,
             'lr_predictor': lr_predictor,
             'lr_y_encoder': lr_y_encoder,
             'effective_batch_size': effective_batch,

@@ -9,12 +9,20 @@ without increasing GPU memory usage. It works by:
 
 Reference: https://github.com/luyug/GradCache
 Paper: "Scaling Deep Contrastive Learning Batch Size under Memory Limited Setup"
+
+IMPORTANT: This module integrates with moco_queue.py for additional negatives.
+The loss function passed to FunctionalGradCache should use infonce_with_queue()
+from moco_queue.py to get consistent training/validation behavior.
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Dict, TYPE_CHECKING
 from functools import partial
+
+# Import MoCo queue for type hints
+if TYPE_CHECKING:
+    from .moco_queue import MoCoQueue
 
 # Try to import GradCache - gracefully handle if not installed
 try:
@@ -191,16 +199,24 @@ class FunctionalGradCache:
     This is more flexible and allows custom model call patterns.
     Use this if CaptionerGradCache doesn't fit your use case.
     
+    IMPORTANT: This class accepts a loss_fn that should use the MoCo queue
+    from moco_queue.py for consistent loss computation with the standard
+    training path. The loss_fn is provided by EmbeddingTrainer.
+    
     Example
     -------
-    >>> fgc = FunctionalGradCache(model, temperature=0.07)
+    >>> # Create with a loss function that uses MoCo queue
+    >>> def loss_fn(pred, target):
+    ...     return infonce_with_queue(pred, target, queue, temp)
+    >>> 
+    >>> fgc = FunctionalGradCache(model, loss_fn=loss_fn)
     >>> 
     >>> # Accumulate sub-batches
     >>> for images, captions in sub_batches:
     ...     fgc.accumulate(images, target_embeds)
     >>> 
     >>> # Compute loss with all accumulated embeddings
-    >>> loss = fgc.compute_loss()
+    >>> loss, metrics = fgc.compute_loss()
     >>> loss.backward()
     >>> 
     >>> # Propagate gradients through cached representations
@@ -208,35 +224,59 @@ class FunctionalGradCache:
     >>> 
     >>> optimizer.step()
     >>> fgc.reset()
+    
+    Parameters
+    ----------
+    model : nn.Module
+        The captioner model (encoder + connector + predictor).
+    loss_fn : callable
+        Loss function that takes (pred_embeds, target_embeds) and returns
+        a dict with at least 'loss' (tensor). The dict should also contain
+        metrics like 'infonce', 'mse', 'alignment', 'uniformity', 'num_negatives'.
+        
+        This function should use infonce_with_queue() from moco_queue.py
+        to ensure consistent loss computation with the standard training path.
     """
     
     def __init__(
         self,
         model,
-        temperature: float = 0.07,
-        mse_alpha: float = 0.0,
+        loss_fn: Callable[[torch.Tensor, torch.Tensor], Dict[str, Any]],
     ):
         check_gradcache_available()
         
         self.model = model
-        self.temperature = temperature
-        self.mse_alpha = mse_alpha
+        self._loss_fn = loss_fn
         
         # Caches for accumulation
         self._pred_cache = []
         self._target_cache = []
         self._closures = []
+        
+        # Store last computed metrics for retrieval
+        self._last_metrics: Optional[Dict[str, Any]] = None
     
     @property
     def num_accumulated(self) -> int:
         """Number of sub-batches accumulated."""
         return len(self._pred_cache)
     
+    @property
+    def last_metrics(self) -> Optional[Dict[str, Any]]:
+        """
+        Get metrics from the last compute_loss() call.
+        
+        Returns dict with 'infonce', 'mse', 'alignment', 'uniformity', 'num_negatives'.
+        Returns None if compute_loss() hasn't been called yet.
+        """
+        return self._last_metrics
+    
     def reset(self):
-        """Clear accumulated caches."""
+        """Clear accumulated caches and metrics."""
         self._pred_cache = []
         self._target_cache = []
         self._closures = []
+        self._last_metrics = None
     
     def accumulate(
         self,
@@ -284,12 +324,20 @@ class FunctionalGradCache:
     
     def compute_loss(self) -> torch.Tensor:
         """
-        Compute loss with ALL accumulated embeddings.
+        Compute loss with ALL accumulated embeddings using the provided loss_fn.
+        
+        The loss_fn is called with concatenated predictions and targets.
+        It should return a dict with 'loss' tensor and metrics like
+        'infonce', 'mse', 'alignment', 'uniformity', 'num_negatives'.
         
         Returns
         -------
         torch.Tensor
             Loss tensor (still attached to graph via leaf tensors).
+            
+        Note
+        ----
+        Call self.last_metrics after this to get the computed metrics.
         """
         if len(self._pred_cache) == 0:
             raise RuntimeError("No sub-batches accumulated. Call accumulate() first.")
@@ -298,49 +346,16 @@ class FunctionalGradCache:
         all_pred = torch.cat(self._pred_cache, dim=0)
         all_target = torch.cat(self._target_cache, dim=0)
         
-        # Compute loss with ALL negatives
-        loss_dict = self._combined_loss(all_pred, all_target)
+        # Compute loss using the provided loss function (which uses MoCo queue)
+        loss_dict = self._loss_fn(all_pred, all_target)
+        
+        # Store metrics for retrieval
+        self._last_metrics = {
+            k: v for k, v in loss_dict.items() 
+            if k != 'loss'  # Don't store the tensor
+        }
         
         return loss_dict['loss']
-    
-    def _combined_loss(self, pred_embeds, target_embeds):
-        """Combined InfoNCE + MSE loss."""
-        B = pred_embeds.shape[0]
-        device = pred_embeds.device
-        
-        # Pool sequence dimension
-        if pred_embeds.dim() == 3:
-            pred_pooled = pred_embeds.mean(dim=1)
-            target_pooled = target_embeds.mean(dim=1)
-        else:
-            pred_pooled = pred_embeds
-            target_pooled = target_embeds
-        
-        # Normalize
-        pred_norm = F.normalize(pred_pooled, dim=-1, p=2)
-        target_norm = F.normalize(target_pooled, dim=-1, p=2)
-        
-        # InfoNCE
-        logits = (pred_norm @ target_norm.T) / self.temperature
-        labels = torch.arange(B, device=device)
-        
-        loss_pt = F.cross_entropy(logits, labels)
-        loss_tp = F.cross_entropy(logits.T, labels)
-        infonce_loss = (loss_pt + loss_tp) / 2
-        
-        # MSE (optional)
-        if self.mse_alpha > 0:
-            mse_loss = F.mse_loss(pred_norm, target_norm)
-            total_loss = infonce_loss + self.mse_alpha * mse_loss
-        else:
-            mse_loss = torch.tensor(0.0)
-            total_loss = infonce_loss
-        
-        return {
-            'loss': total_loss,
-            'infonce': infonce_loss.item(),
-            'mse': mse_loss.item() if isinstance(mse_loss, torch.Tensor) else mse_loss,
-        }
     
     def backward_cached(self):
         """
@@ -352,75 +367,3 @@ class FunctionalGradCache:
             if pred_leaf.grad is not None:
                 closure(pred_leaf.grad)
 
-
-def create_gradcache_trainer(
-    model,
-    chunk_size: int = 32,
-    temperature: float = 0.07,
-    mse_alpha: float = 0.0,
-    fp16: bool = False,
-    scaler=None,
-) -> CaptionerGradCache:
-    """
-    Factory function to create a GradCache trainer.
-    
-    Parameters
-    ----------
-    model : LeJEPACaptioner
-        The captioner model.
-    chunk_size : int
-        Sub-batch size for memory-efficient training.
-    temperature : float
-        InfoNCE temperature.
-    mse_alpha : float
-        MSE loss weight (0 = pure InfoNCE).
-    fp16 : bool
-        Use mixed precision.
-    scaler : GradScaler, optional
-        For mixed precision training.
-        
-    Returns
-    -------
-    CaptionerGradCache
-        Ready-to-use GradCache trainer.
-    """
-    check_gradcache_available()
-    
-    def combined_loss_fn(pred_embeds, target_embeds):
-        B = pred_embeds.shape[0]
-        device = pred_embeds.device
-        
-        # Pool
-        if pred_embeds.dim() == 3:
-            pred_pooled = pred_embeds.mean(dim=1)
-            target_pooled = target_embeds.mean(dim=1)
-        else:
-            pred_pooled = pred_embeds
-            target_pooled = target_embeds
-        
-        # Normalize
-        pred_norm = F.normalize(pred_pooled, dim=-1, p=2)
-        target_norm = F.normalize(target_pooled, dim=-1, p=2)
-        
-        # InfoNCE
-        logits = (pred_norm @ target_norm.T) / temperature
-        labels = torch.arange(B, device=device)
-        
-        loss_pt = F.cross_entropy(logits, labels)
-        loss_tp = F.cross_entropy(logits.T, labels)
-        infonce_loss = (loss_pt + loss_tp) / 2
-        
-        # MSE
-        if mse_alpha > 0:
-            mse_loss = F.mse_loss(pred_norm, target_norm)
-            return infonce_loss + mse_alpha * mse_loss
-        
-        return infonce_loss
-    
-    return CaptionerGradCache(
-        model=model,
-        chunk_size=chunk_size,
-        loss_fn=combined_loss_fn,
-        fp16=fp16,
-        scaler=scaler,
-    )

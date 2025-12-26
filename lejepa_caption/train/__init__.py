@@ -7,7 +7,6 @@ from lejepa_caption.train.gradcache import (
     check_gradcache_available,
     CaptionerGradCache,
     FunctionalGradCache,
-    create_gradcache_trainer,
 )
 
 __all__ = [
@@ -20,5 +19,4 @@ __all__ = [
     "check_gradcache_available",
     "CaptionerGradCache",
     "FunctionalGradCache",
-    "create_gradcache_trainer",
 ]
