@@ -2,17 +2,18 @@
 Training utilities for LeJEPA Edge Captioner.
 
 Following VL-JEPA paper (Dec 2024):
-- InfoNCE loss (alignment + uniformity)
+- Combined InfoNCE + MSE loss (direction + magnitude)
+- Optional MoCo-style memory queue for more negatives
 - Y-Encoder with 0.05x LR multiplier (learns 20x slower)
 - LR warmup + cosine decay
 - Wandb logging
 - Best model checkpoint saving
 
-Key benefits over MSE:
-1. InfoNCE is less strict: Only cares about direction, not exact values
-2. Y-Encoder stability: Slow updates prevent learning from bad predictions
-3. Better alignment metric: align=0.65 means embeddings point in similar direction
-4. VL-JEPA validated: This exact approach works in their 1.6B model
+Key benefits:
+1. InfoNCE cares about direction (more forgiving than pure MSE)
+2. MSE keeps embeddings on-manifold (better decoding)
+3. MoCo queue: 4096+ negatives without large batch sizes
+4. VL-JEPA validated: This approach works in their 1.6B model
 """
 
 import os
@@ -31,6 +32,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from lejepa_caption.models import LeJEPACaptioner, get_captioner
+from lejepa_caption.train.moco_queue import MoCoQueue, infonce_with_queue
+from lejepa_caption.train.gradcache import (
+    GRADCACHE_AVAILABLE,
+    FunctionalGradCache,
+)
 
 
 def get_best_device() -> torch.device:
@@ -50,6 +56,7 @@ class EmbeddingTrainer:
     - InfoNCE loss (not MSE or SIGReg)
     - Y-Encoder with 0.05x LR multiplier
     - LR warmup + cosine decay
+    - Optional MoCo queue for more negatives
     - Wandb logging
     """
 
@@ -63,6 +70,11 @@ class EmbeddingTrainer:
         y_encoder_lr_multiplier: float = 0.05,  # Y-Encoder learns 20x slower
         weight_decay: float = 0.01,
         temperature: float = 0.07,  # InfoNCE temperature
+        mse_alpha: float = 0.0,  # MSE weight (0 = pure InfoNCE, 0.15 = recommended)
+        use_moco_queue: bool = False,  # Enable memory queue for negatives
+        queue_size: int = 4096,  # Number of negatives to store
+        use_gradcache: bool = False,  # Enable GradCache for large effective batches
+        gradcache_chunk_size: int = 32,  # Sub-batch size for GradCache
         use_amp: bool = False,
         use_lr_schedule: bool = True,
         total_steps: Optional[int] = None,  # Required if use_lr_schedule=True
@@ -75,8 +87,35 @@ class EmbeddingTrainer:
         self.device = device
         self.use_amp = use_amp
         self.temperature = temperature
+        self.mse_alpha = mse_alpha  # Combined loss weight
+        self.use_moco_queue = use_moco_queue
+        self.use_gradcache = use_gradcache
+        self.gradcache_chunk_size = gradcache_chunk_size
         self.use_wandb = use_wandb
         self.scaler = GradScaler(enabled=use_amp and torch.cuda.is_available())
+
+        # GradCache for large effective batch sizes
+        if use_gradcache:
+            if not GRADCACHE_AVAILABLE:
+                raise ImportError(
+                    "GradCache requested but not installed. Install with:\n"
+                    "  pip install git+https://github.com/luyug/GradCache.git"
+                )
+            self.grad_cache = FunctionalGradCache(
+                model=model,
+                temperature=temperature,
+                mse_alpha=mse_alpha,
+            )
+        else:
+            self.grad_cache = None
+
+        # MoCo-style memory queue for negatives
+        if use_moco_queue:
+            # Get LLM embedding dimension
+            llm_dim = llm.get_input_embeddings().embedding_dim
+            self.moco_queue = MoCoQueue(dim=llm_dim, queue_size=queue_size, device=device)
+        else:
+            self.moco_queue = None
 
         # Preloaded tokenizer/LLM
         self.tokenizer = tokenizer
@@ -163,21 +202,27 @@ class EmbeddingTrainer:
         target_embeds: torch.Tensor
     ) -> dict:
         """
-        Compute InfoNCE loss (VL-JEPA approach).
+        Compute combined InfoNCE + MSE loss.
 
         InfoNCE = Alignment (cosine similarity) + Uniformity (anti-collapse)
+        MSE = Mean squared error on normalized embeddings (magnitude matching)
 
-        Benefits over MSE:
-        1. Only cares about direction, not exact values (more forgiving)
-        2. Uniformity term prevents collapse without external regularization
-        3. Works better for generation (LLM decoding is direction-sensitive)
+        Combined loss: L_total = L_InfoNCE + alpha * L_MSE
+
+        If MoCo queue is enabled, uses queue negatives for better contrastive signal.
+
+        Benefits:
+        1. InfoNCE cares about direction (more forgiving)
+        2. MSE keeps embeddings on-manifold (better decoding)
+        3. MoCo queue: 4096+ negatives without large batch sizes
+        4. Combined: Direction + magnitude = better alignment
 
         Args:
             pred_embeds: Predicted embeddings (B, L, D)
             target_embeds: Target embeddings (B, L, D)
 
         Returns:
-            dict with 'loss', 'alignment', 'uniformity'
+            dict with 'loss', 'infonce', 'mse', 'alignment', 'uniformity', 'num_negatives'
         """
         B, L, D = pred_embeds.shape
 
@@ -190,16 +235,38 @@ class EmbeddingTrainer:
         pred_norm = F.normalize(pred_pooled, dim=-1, p=2)
         target_norm = F.normalize(target_pooled, dim=-1, p=2)
 
-        # Cosine similarity matrix: (B) x (B)
-        logits = (pred_norm @ target_norm.T) / self.temperature
+        # ===== InfoNCE Component =====
+        if self.moco_queue is not None and len(self.moco_queue) > 0:
+            # Use queue for extra negatives
+            infonce_loss = infonce_with_queue(
+                pred_norm, target_norm, 
+                self.moco_queue, 
+                self.temperature
+            )
+            num_negatives = B - 1 + len(self.moco_queue)
+            
+            # Update queue with current batch targets (after computing loss)
+            self.moco_queue.enqueue(target_norm.detach())
+        else:
+            # Standard bi-directional InfoNCE
+            logits = (pred_norm @ target_norm.T) / self.temperature
+            labels = torch.arange(B, device=self.device)
+            loss_pred_to_target = F.cross_entropy(logits, labels)
+            loss_target_to_pred = F.cross_entropy(logits.T, labels)
+            infonce_loss = (loss_pred_to_target + loss_target_to_pred) / 2
+            num_negatives = B - 1
+            
+            # If queue exists but is empty, start filling it
+            if self.moco_queue is not None:
+                self.moco_queue.enqueue(target_norm.detach())
 
-        # Labels: diagonal (pred[i] should match target[i])
-        labels = torch.arange(B, device=self.device)
+        # ===== MSE Component (on normalized embeddings) =====
+        # This keeps predictions on the LLM embedding manifold
+        mse_loss = F.mse_loss(pred_norm, target_norm)
 
-        # Bi-directional InfoNCE (pred->target and target->pred)
-        loss_pred_to_target = F.cross_entropy(logits, labels)
-        loss_target_to_pred = F.cross_entropy(logits.T, labels)
-        loss = (loss_pred_to_target + loss_target_to_pred) / 2
+        # ===== Combined Loss =====
+        # alpha=0 → pure InfoNCE, alpha=0.15 → recommended hybrid
+        total_loss = infonce_loss + self.mse_alpha * mse_loss
 
         # Compute metrics for logging
         with torch.no_grad():
@@ -213,9 +280,110 @@ class EmbeddingTrainer:
             uniformity = pred_sim.triu(diagonal=1).mean()
 
         return {
-            'loss': loss,
+            'loss': total_loss,
+            'infonce': infonce_loss.item() if hasattr(infonce_loss, 'item') else infonce_loss,
+            'mse': mse_loss.item(),
             'alignment': alignment.item(),
             'uniformity': uniformity.item(),
+            'num_negatives': num_negatives,
+        }
+
+    def gradcache_accumulate(
+        self,
+        images: torch.Tensor,
+        captions: list,
+    ):
+        """
+        Accumulate a sub-batch for GradCache training.
+        
+        Call this multiple times to accumulate sub-batches, then call
+        gradcache_step() to compute loss and update weights.
+        
+        Args:
+            images: Sub-batch of images (B, 3, 224, 224)
+            captions: List of caption strings
+        """
+        if self.grad_cache is None:
+            raise RuntimeError("GradCache not enabled. Set use_gradcache=True in constructor.")
+        
+        self.model.train()
+        images = images.to(self.device)
+        
+        # Get target embeddings
+        with torch.no_grad():
+            # Need to determine target seq len - use model's config
+            max_len = self.model.config.get('max_caption_len', 50)
+            target_embeds = self.get_target_embeddings(captions, max_len=max_len)
+        
+        # Accumulate in GradCache
+        self.grad_cache.accumulate(images, target_embeds)
+        
+        # Update MoCo queue with targets (if enabled)
+        if self.moco_queue is not None:
+            with torch.no_grad():
+                target_pooled = target_embeds.mean(dim=1)
+                target_norm = F.normalize(target_pooled, dim=-1, p=2)
+                self.moco_queue.enqueue(target_norm)
+    
+    def gradcache_step(self, global_step: int = 0) -> dict:
+        """
+        Compute loss from accumulated sub-batches and update weights.
+        
+        Call this after accumulating sub-batches with gradcache_accumulate().
+        
+        Args:
+            global_step: Current training step (for logging)
+            
+        Returns:
+            Dict with loss and metrics
+        """
+        if self.grad_cache is None:
+            raise RuntimeError("GradCache not enabled. Set use_gradcache=True in constructor.")
+        
+        if self.grad_cache.num_accumulated == 0:
+            raise RuntimeError("No sub-batches accumulated. Call gradcache_accumulate() first.")
+        
+        self.optimizer.zero_grad(set_to_none=True)
+        
+        # Compute loss with ALL accumulated embeddings
+        loss = self.grad_cache.compute_loss()
+        loss.backward()
+        
+        # Propagate gradients through cached representations
+        self.grad_cache.backward_cached()
+        
+        # Optimizer step
+        self.optimizer.step()
+        
+        # Update LR schedule
+        if self.scheduler is not None:
+            self.scheduler.step()
+        
+        # Get metrics
+        loss_value = loss.item()
+        lr_predictor = self.optimizer.param_groups[0]['lr']
+        lr_y_encoder = self.optimizer.param_groups[1]['lr']
+        effective_batch = sum(p.shape[0] for p in self.grad_cache._pred_cache)
+        
+        # Reset cache for next accumulation cycle
+        self.grad_cache.reset()
+        
+        # Wandb logging
+        if self.use_wandb:
+            import wandb
+            wandb.log({
+                "train/loss": loss_value,
+                "train/lr_predictor": lr_predictor,
+                "train/lr_y_encoder": lr_y_encoder,
+                "train/effective_batch_size": effective_batch,
+                "train/step": global_step,
+            })
+        
+        return {
+            'loss': loss_value,
+            'lr_predictor': lr_predictor,
+            'lr_y_encoder': lr_y_encoder,
+            'effective_batch_size': effective_batch,
         }
 
     def train_step(
@@ -277,6 +445,8 @@ class EmbeddingTrainer:
             import wandb
             wandb.log({
                 "train/loss": loss.item(),
+                "train/infonce": loss_dict['infonce'],
+                "train/mse": loss_dict['mse'],
                 "train/alignment": loss_dict['alignment'],
                 "train/uniformity": loss_dict['uniformity'],
                 "train/lr_predictor": lr_predictor,
@@ -286,6 +456,8 @@ class EmbeddingTrainer:
 
         return {
             'loss': loss.item(),
+            'infonce': loss_dict['infonce'],
+            'mse': loss_dict['mse'],
             'alignment': loss_dict['alignment'],
             'uniformity': loss_dict['uniformity'],
             'lr_predictor': lr_predictor,
@@ -305,6 +477,8 @@ class EmbeddingTrainer:
         """
         self.model.eval()
         total_loss = 0
+        total_infonce = 0
+        total_mse = 0
         total_alignment = 0
         total_uniformity = 0
         num_batches = 0
@@ -323,6 +497,8 @@ class EmbeddingTrainer:
                 loss_dict = self.infonce_loss(pred_embeds, target_embeds)
 
                 total_loss += loss_dict['loss'].item()
+                total_infonce += loss_dict['infonce']
+                total_mse += loss_dict['mse']
                 total_alignment += loss_dict['alignment']
                 total_uniformity += loss_dict['uniformity']
                 num_batches += 1
@@ -330,6 +506,8 @@ class EmbeddingTrainer:
         denom = max(1, num_batches)
         val_metrics = {
             "val_loss": total_loss / denom,
+            "val_infonce": total_infonce / denom,
+            "val_mse": total_mse / denom,
             "val_alignment": total_alignment / denom,
             "val_uniformity": total_uniformity / denom,
         }
@@ -339,6 +517,8 @@ class EmbeddingTrainer:
             import wandb
             wandb.log({
                 "val/loss": val_metrics["val_loss"],
+                "val/infonce": val_metrics["val_infonce"],
+                "val/mse": val_metrics["val_mse"],
                 "val/alignment": val_metrics["val_alignment"],
                 "val/uniformity": val_metrics["val_uniformity"],
                 "val/epoch": epoch,
@@ -384,6 +564,11 @@ def train_with_loader(
     y_encoder_lr_multiplier: float = 0.05,  # Y-Encoder learns 20x slower
     weight_decay: float = 0.01,
     temperature: float = 0.07,  # InfoNCE temperature
+    mse_alpha: float = 0.0,  # MSE weight (0 = pure InfoNCE, 0.15 = recommended)
+    use_moco_queue: bool = False,  # Enable memory queue for negatives
+    queue_size: int = 4096,  # Number of negatives to store
+    use_gradcache: bool = False,  # Enable GradCache for large effective batches
+    gradcache_accum_steps: int = 4,  # Number of sub-batches to accumulate
     use_amp: bool = False,
     use_lr_schedule: bool = True,
     epochs: int = 3,
@@ -396,7 +581,9 @@ def train_with_loader(
     Train with VL-JEPA approach.
 
     Key features:
-    - InfoNCE loss (alignment + uniformity)
+    - Combined InfoNCE + MSE loss (alpha controls MSE weight)
+    - Optional MoCo queue for 4096+ negatives
+    - Optional GradCache for large effective batch sizes
     - Y-Encoder with 0.05x LR multiplier
     - LR warmup + cosine decay
     - Validation every epoch
@@ -414,6 +601,11 @@ def train_with_loader(
         y_encoder_lr_multiplier: LR multiplier for Y-Encoder (default 0.05)
         weight_decay: AdamW weight decay
         temperature: InfoNCE temperature
+        mse_alpha: MSE loss weight (0 = pure InfoNCE, 0.15 = recommended hybrid)
+        use_moco_queue: Enable MoCo-style memory queue for negatives
+        queue_size: Number of embeddings to store in queue (default 4096)
+        use_gradcache: Enable GradCache for large effective batch sizes
+        gradcache_accum_steps: Number of sub-batches to accumulate before update
         use_amp: Use automatic mixed precision
         use_lr_schedule: Use warmup + cosine decay
         epochs: Number of training epochs
@@ -441,16 +633,27 @@ def train_with_loader(
                 "y_encoder_lr_multiplier": y_encoder_lr_multiplier,
                 "weight_decay": weight_decay,
                 "temperature": temperature,
+                "mse_alpha": mse_alpha,
+                "use_moco_queue": use_moco_queue,
+                "queue_size": queue_size if use_moco_queue else 0,
+                "use_gradcache": use_gradcache,
+                "gradcache_accum_steps": gradcache_accum_steps if use_gradcache else 0,
                 "use_amp": use_amp,
                 "use_lr_schedule": use_lr_schedule,
                 "epochs": epochs,
                 "batch_size": train_loader.batch_size,
+                "effective_batch_size": train_loader.batch_size * gradcache_accum_steps if use_gradcache else train_loader.batch_size,
                 "model_params": sum(p.numel() for p in model.parameters()) / 1e6,
             }
         )
 
     # Calculate total steps for LR schedule
-    total_steps = len(train_loader) * epochs if use_lr_schedule else None
+    # With GradCache, we update less frequently (every accum_steps batches)
+    if use_gradcache:
+        steps_per_epoch = len(train_loader) // gradcache_accum_steps
+    else:
+        steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * epochs if use_lr_schedule else None
 
     trainer = EmbeddingTrainer(
         model,
@@ -461,17 +664,26 @@ def train_with_loader(
         y_encoder_lr_multiplier=y_encoder_lr_multiplier,
         weight_decay=weight_decay,
         temperature=temperature,
+        mse_alpha=mse_alpha,
+        use_moco_queue=use_moco_queue,
+        queue_size=queue_size,
+        use_gradcache=use_gradcache,
+        gradcache_chunk_size=train_loader.batch_size,  # Each batch is a chunk
         use_amp=use_amp,
         use_lr_schedule=use_lr_schedule,
         total_steps=total_steps,
         use_wandb=use_wandb,
     )
 
+    effective_batch = train_loader.batch_size * gradcache_accum_steps if use_gradcache else train_loader.batch_size
+
     print(f"\n{'='*60}")
     print(f"Training with VL-JEPA approach:")
-    print(f"  - Loss: InfoNCE (alignment + uniformity)")
+    print(f"  - Loss: InfoNCE + MSE (alpha={mse_alpha})")
     print(f"  - Predictor LR: {lr}")
     print(f"  - Y-Encoder LR: {lr * y_encoder_lr_multiplier} (0.05x slower)")
+    print(f"  - MoCo Queue: {'Enabled (size=' + str(queue_size) + ')' if use_moco_queue else 'Disabled'}")
+    print(f"  - GradCache: {'Enabled (accum=' + str(gradcache_accum_steps) + ', effective_batch=' + str(effective_batch) + ')' if use_gradcache else 'Disabled'}")
     print(f"  - LR Schedule: {'Warmup + Cosine Decay' if use_lr_schedule else 'Constant'}")
     print(f"  - Wandb: {'Enabled' if use_wandb else 'Disabled'}")
     print(f"  - Checkpoint Dir: {checkpoint_dir}")
@@ -482,15 +694,41 @@ def train_with_loader(
     for epoch in range(1, epochs + 1):
         # Training
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
-        for images, captions in pbar:
-            stats = trainer.train_step(images, captions, global_step)
-            pbar.set_postfix({
-                "loss": f"{stats['loss']:.4f}",
-                "align": f"{stats['alignment']:.4f}",
-                "unif": f"{stats['uniformity']:.4f}",
-                "lr": f"{stats['lr_predictor']:.2e}",
-            })
-            global_step += 1
+        
+        if use_gradcache:
+            # GradCache training loop: accumulate then update
+            accum_count = 0
+            for images, captions in pbar:
+                # Accumulate sub-batch
+                trainer.gradcache_accumulate(images, captions)
+                accum_count += 1
+                
+                # Update after accumulating enough sub-batches
+                if accum_count >= gradcache_accum_steps:
+                    stats = trainer.gradcache_step(global_step)
+                    pbar.set_postfix({
+                        "loss": f"{stats['loss']:.4f}",
+                        "eff_bs": stats['effective_batch_size'],
+                        "lr": f"{stats['lr_predictor']:.2e}",
+                    })
+                    global_step += 1
+                    accum_count = 0
+            
+            # Handle remaining accumulated batches at end of epoch
+            if accum_count > 0:
+                stats = trainer.gradcache_step(global_step)
+                global_step += 1
+        else:
+            # Standard training loop
+            for images, captions in pbar:
+                stats = trainer.train_step(images, captions, global_step)
+                pbar.set_postfix({
+                    "loss": f"{stats['loss']:.4f}",
+                    "align": f"{stats['alignment']:.4f}",
+                    "unif": f"{stats['uniformity']:.4f}",
+                    "lr": f"{stats['lr_predictor']:.2e}",
+                })
+                global_step += 1
 
         # Validation
         val_metrics = trainer.validate(val_loader, epoch)
