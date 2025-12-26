@@ -752,6 +752,9 @@ def train_with_loader(
                     stats = trainer.gradcache_step(global_step)
                     pbar.set_postfix({
                         "loss": f"{stats['loss']:.4f}",
+                        "infonce": f"{stats['infonce']:.4f}",
+                        "mse": f"{stats['mse']:.4f}",
+                        "align": f"{stats['alignment']:.3f}",
                         "eff_bs": stats['effective_batch_size'],
                         "lr": f"{stats['lr_predictor']:.2e}",
                     })
@@ -768,8 +771,9 @@ def train_with_loader(
                 stats = trainer.train_step(images, captions, global_step)
                 pbar.set_postfix({
                     "loss": f"{stats['loss']:.4f}",
-                    "align": f"{stats['alignment']:.4f}",
-                    "unif": f"{stats['uniformity']:.4f}",
+                    "infonce": f"{stats['infonce']:.4f}",
+                    "mse": f"{stats['mse']:.4f}",
+                    "align": f"{stats['alignment']:.3f}",
                     "lr": f"{stats['lr_predictor']:.2e}",
                 })
                 global_step += 1
