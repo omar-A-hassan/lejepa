@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
@@ -92,7 +92,7 @@ class EmbeddingTrainer:
         self.use_gradcache = use_gradcache
         self.gradcache_chunk_size = gradcache_chunk_size
         self.use_wandb = use_wandb
-        self.scaler = GradScaler(enabled=use_amp and torch.cuda.is_available())
+        self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp and torch.cuda.is_available())
 
         # GradCache for large effective batch sizes
         if use_gradcache:
