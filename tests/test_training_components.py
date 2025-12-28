@@ -247,7 +247,11 @@ class TestTargetEmbeddings:
     """Test target embedding extraction from LLM."""
 
     def test_target_embedding_shape(self):
-        """Test target embeddings have correct shape."""
+        """Test CONTEXTUAL target embeddings have correct shape.
+        
+        This tests the VL-JEPA Y-Encoder approach: running full LLM forward
+        pass to get contextualized embeddings, NOT raw embedding table lookup.
+        """
         from transformers import AutoTokenizer, AutoModelForCausalLM
 
         # Load Gemma-3-270m components (matches training notebook)
@@ -255,12 +259,11 @@ class TestTargetEmbeddings:
             tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m-it")
             tokenizer.pad_token = tokenizer.eos_token
 
-            # Get embedding layer (simulating what train.py does)
+            # Load full model for contextual embeddings (Y-Encoder)
             model = AutoModelForCausalLM.from_pretrained(
                 "google/gemma-3-270m-it",
                 torch_dtype=torch.bfloat16
             )
-            embed_layer = model.get_input_embeddings()
 
             # Tokenize captions
             captions = ["A cat sitting on a mat", "A dog running in park"]
@@ -272,9 +275,16 @@ class TestTargetEmbeddings:
                 return_tensors="pt"
             )
 
-            # Get embeddings
+            # Get CONTEXTUAL embeddings via LLM forward pass
+            # This is the correct VL-JEPA approach (not embedding table lookup)
             with torch.no_grad():
-                embeddings = embed_layer(tokens.input_ids)
+                outputs = model(
+                    input_ids=tokens.input_ids,
+                    attention_mask=tokens.attention_mask,
+                    output_hidden_states=True,
+                )
+                # Use last hidden state - fully contextualized
+                embeddings = outputs.hidden_states[-1]
 
             # Check shape
             batch_size = len(captions)
@@ -286,11 +296,11 @@ class TestTargetEmbeddings:
             assert embeddings.shape[2] == 640, \
                 f"Expected dim=640 (Gemma-3-270m), got {embeddings.shape[2]}"
 
-            print(f"\nTarget embedding extraction:")
+            print(f"\nContextual target embedding extraction (Y-Encoder):")
             print(f"  Shape: {embeddings.shape}")
             print(f"  Mean: {embeddings.float().mean():.4f}")
             print(f"  Std: {embeddings.float().std():.4f}")
-            print("  Extraction works (OK)")
+            print("  Contextual embeddings extracted (OK)")
 
         except Exception as e:
             pytest.skip(f"Skipping: Could not load Gemma model ({e})")

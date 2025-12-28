@@ -177,14 +177,22 @@ class EmbeddingTrainer:
         max_len: int = 50
     ) -> torch.Tensor:
         """
-        Get target text embeddings from Gemma3.
+        Get CONTEXTUAL target text embeddings from Gemma3.
+        
+        Unlike raw embedding table lookup, this runs the full LLM forward
+        pass to get contextualized representations where each token embedding
+        understands its relationship to other tokens in the caption.
+        
+        This is critical for VL-JEPA training:
+        - Raw embeddings: "red" and "bus" are independent vectors (WRONG)
+        - Contextual: "red" knows it modifies "bus", full semantic meaning (CORRECT)
 
         Args:
             captions: List of caption strings
             max_len: Max sequence length
 
         Returns:
-            Target embeddings (B, max_len, llm_dim)
+            Target embeddings (B, max_len, llm_dim) - contextualized
         """
         tokens = self.tokenizer(
             captions,
@@ -195,7 +203,18 @@ class EmbeddingTrainer:
         ).to(self.device)
 
         with torch.no_grad():
-            embeddings = self.llm.get_input_embeddings()(tokens.input_ids)
+            # Run full LLM forward pass to get CONTEXTUAL embeddings
+            # This is the Y-Encoder in VL-JEPA terminology
+            outputs = self.llm(
+                input_ids=tokens.input_ids,
+                attention_mask=tokens.attention_mask,
+                output_hidden_states=True,
+            )
+            
+            # Use last hidden state - fully contextualized
+            # Each token's embedding now "knows" about all other tokens
+            # Shape: (B, L, D) - same as before, but now MEANINGFUL
+            embeddings = outputs.hidden_states[-1]
 
         return embeddings.float()
     
